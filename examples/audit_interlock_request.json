@@ -1,0 +1,23 @@
+{
+  "events": [
+    { "kind": "shutter", "time": 0.0, "state": "open" },
+    { "kind": "wind", "time": 1.0, "value": 10.0 },
+    { "kind": "rain", "time": 2.0, "value": 1.0 },
+    { "kind": "wind", "time": 3.0, "value": 25.0 },
+    { "kind": "close_command", "time": 10.0 },
+    { "kind": "shutter", "time": 12.0, "state": "closing" },
+    { "kind": "shutter", "time": 14.0, "state": "closed" },
+    { "kind": "wind", "time": 20.0, "value": 10.0 },
+    { "kind": "shutter", "time": 30.0, "state": "opening" },
+    { "kind": "shutter", "time": 32.0, "state": "open" }
+  ],
+  "wind_trip": 20.0,
+  "wind_reset": 15.0,
+  "rain_trip": 10.0,
+  "rain_reset": 5.0,
+  "trip_duration": 5.0,
+  "reset_duration": 5.0,
+  "stale_after": 30.0,
+  "command_deadline": 60.0,
+  "close_deadline": 120.0
+}

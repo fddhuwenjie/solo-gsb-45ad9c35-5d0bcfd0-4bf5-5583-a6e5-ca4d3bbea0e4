@@ -1,0 +1,9 @@
+{
+  "target_azimuths": [10.0, 300.0],
+  "times": [1.0, 2.0],
+  "initial_angle": 0.0,
+  "max_speed": 10.0,
+  "slit_width": 10.0,
+  "cable_low": -180.0,
+  "cable_high": 180.0
+}
