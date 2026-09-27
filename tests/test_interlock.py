@@ -196,7 +196,10 @@ def test_audit_stale_boundary_strictly_greater():
 
 
 def test_audit_same_tick_order_and_zero_length_shutter_segments():
-    # 同刻事件严格按输入顺序处理；同刻多次快门转换产生零长段
+    # 顺序 A：同刻先以 trip_duration=0 的天气事件进入 unsafe，随后才提交
+    # close_command / closing / closed —— 后到的 closed 是入口**之后**的
+    # 履行，不得标 already_closed_at_entry；同刻事件严格按输入顺序处理，
+    # 同刻多次快门转换仍产生零长段
     events = [
         {"kind": "shutter", "time": 5.0, "state": "open"},      # 0
         {"kind": "wind", "time": 5.0, "value": 30.0},           # 1 -> 当刻 unsafe
@@ -224,10 +227,165 @@ def test_audit_same_tick_order_and_zero_length_shutter_segments():
     ]
     ri = body["risk_intervals"][0]
     assert ri["start"] == 5.0
+    assert ri["entry_event_indices"] == [1]
+    # 命令在入口（天气事件 1）之后：履行本次义务
+    assert ri["command_time"] == 5.0
     assert ri["command_event_index"] == 2
     assert ri["command_overdue"] == 0.0
-    assert ri["already_closed_at_entry"] is True
+    # closed 也在入口之后：属于履行而非“进入时已关闭”
+    assert ri["already_closed_at_entry"] is False
+    assert ri["closed_time"] == 5.0
     assert ri["closed_event_index"] == 4
+    assert ri["close_overdue"] == 0.0
+    # 命令全量列表不受归属判断影响
+    assert body["close_commands"] == [{"time": 5.0, "event_index": 2}]
+
+
+def test_audit_same_tick_command_before_weather_entry():
+    # 顺序 B（相反顺序）：同刻先提交 close_command / closing / closed，
+    # 触发天气事件排在其后 —— 义务尚未产生时的命令不得计作履行；入口前
+    # 已生效的 closed 才设置 already_closed_at_entry
+    events = [
+        {"kind": "wind", "time": 0.0, "value": 5.0},            # 0 -> safe@0
+        {"kind": "shutter", "time": 0.0, "state": "open"},      # 1
+        {"kind": "close_command", "time": 5.0},                 # 2（入口前）
+        {"kind": "shutter", "time": 5.0, "state": "closing"},   # 3（入口前）
+        {"kind": "shutter", "time": 5.0, "state": "closed"},    # 4（入口前）
+        {"kind": "wind", "time": 5.0, "value": 30.0},           # 5 -> 当刻 unsafe
+        {"kind": "wind", "time": 10.0, "value": 30.0},          # 6（拉远 horizon）
+    ]
+    r = _post(_payload(events, trip_duration=0.0, stale_after=1000.0,
+                       command_deadline=2.0, close_deadline=10.0))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(s["start"], s["end"], s["state"], s["projected"])
+            for s in body["status_timeline"]] == [
+        (0.0, 5.0, "safe", False),
+        (5.0, 1010.0, "unsafe", False),
+        (1010.0, None, "unknown", True),
+    ]
+    risks = body["risk_intervals"]
+    assert len(risks) == 1
+    ri = risks[0]
+    assert ri["start"] == 5.0 and ri["end"] is None
+    assert ri["entry_event_indices"] == [5]
+    # 唯一命令在入口之前：不履行；超期量截算到 horizon（10 − 7 = 3）
+    assert ri["command_time"] is None
+    assert ri["command_event_index"] is None
+    assert ri["command_overdue"] == 3.0
+    # closed 在入口之前已生效：视为进入时刻确认，索引为入口前的事件 4
+    assert ri["already_closed_at_entry"] is True
+    assert ri["closed_time"] == 5.0
+    assert ri["closed_event_index"] == 4
+    assert ri["close_overdue"] == 0.0
+    # 全量命令列表仍保留入口前的命令
+    assert body["close_commands"] == [{"time": 5.0, "event_index": 2}]
+
+
+def test_audit_timer_matures_before_same_tick_group():
+    # trip_duration > 0：计时器在同刻事件组之前成熟（run_fire 恰为组时刻），
+    # 入口位于 (t, -1)，该时刻全部输入事件都在入口之后、可履行义务
+    events = [
+        {"kind": "shutter", "time": 0.0, "state": "open"},      # 0
+        {"kind": "wind", "time": 0.0, "value": 5.0},            # 1 -> safe@0
+        {"kind": "wind", "time": 10.0, "value": 30.0},          # 2 -> 计时至 15
+        {"kind": "close_command", "time": 15.0},                # 3（入口后）
+        {"kind": "shutter", "time": 15.0, "state": "closing"},  # 4（入口后）
+        {"kind": "shutter", "time": 15.0, "state": "closed"},   # 5（入口后）
+        {"kind": "wind", "time": 20.0, "value": 30.0},          # 6（horizon）
+    ]
+    r = _post(_payload(events, trip_duration=5.0, stale_after=1000.0,
+                       command_deadline=0.0, close_deadline=0.0))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(s["start"], s["end"], s["state"], s["projected"])
+            for s in body["status_timeline"]] == [
+        (0.0, 15.0, "safe", False),
+        (15.0, 1020.0, "unsafe", False),
+        (1020.0, None, "unknown", True),
+    ]
+    ri = body["risk_intervals"][0]
+    assert ri["start"] == 15.0
+    assert ri["entry_event_indices"] == [2]
+    assert ri["projected"] is False
+    assert ri["command_time"] == 15.0
+    assert ri["command_event_index"] == 3
+    assert ri["command_overdue"] == 0.0
+    assert ri["already_closed_at_entry"] is False
+    assert ri["closed_time"] == 15.0
+    assert ri["closed_event_index"] == 5
+    assert ri["close_overdue"] == 0.0
+
+
+def test_audit_stale_boundary_command_not_credited():
+    # 中断要求“严格超过”：中断回拨到 stale_bound=10 时位于该时刻全部输入
+    # 事件之后 (10, +∞)，恰在边界到达的命令不能履行 unknown 义务；
+    # 超期量截算到闭区间末端 20（10 + deadline 5 → 5 秒）
+    events = [
+        {"kind": "shutter", "time": 0.0, "state": "open"},      # 0
+        {"kind": "wind", "time": 0.0, "value": 5.0},            # 1 -> safe@0
+        {"kind": "close_command", "time": 10.0},                # 2（恰在边界）
+        {"kind": "wind", "time": 20.0, "value": 5.0},           # 3 -> 20 恢复
+    ]
+    r = _post(_payload(events, stale_after=10.0,
+                       command_deadline=5.0, close_deadline=5.0))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(s["start"], s["end"], s["state"]) for s in body["status_timeline"]] == [
+        (0.0, 10.0, "safe"),
+        (10.0, 20.0, "unknown"),
+        (20.0, 30.0, "safe"),
+        (30.0, None, "unknown"),
+    ]
+    # 初始段在 wind@0 被同刻覆盖；第一段风险是回拨的 unknown[10,20)
+    ri = next(i for i in body["risk_intervals"] if i["start"] == 10.0)
+    assert ri["end"] == 20.0
+    assert ri["command_time"] is None
+    assert ri["command_event_index"] is None
+    assert ri["command_overdue"] == 5.0   # 20 − 15
+    assert ri["already_closed_at_entry"] is False
+    assert ri["closed_time"] is None
+    assert ri["closed_event_index"] is None
+    assert ri["close_overdue"] == 5.0     # 20 − 15
+    # 全量命令列表仍记录边界命令
+    assert body["close_commands"] == [{"time": 10.0, "event_index": 2}]
+
+
+def test_audit_projected_entry_ignores_last_tick_actions():
+    # 末尾投影：触发计时在末事件之后（15 > 10）成熟，投影入口 (15, -1)。
+    # 末时刻 10 的命令 / closed 都在入口之前：命令不计履行（截算到 horizon
+    # 10，未超 due=15 故为 0）；入口前已 closed → already_closed_at_entry，
+    # 视为入口时刻 15 确认并返回入口前的事件索引
+    events = [
+        {"kind": "wind", "time": 0.0, "value": 5.0},            # 0 -> safe@0
+        {"kind": "shutter", "time": 0.0, "state": "open"},      # 1
+        {"kind": "wind", "time": 10.0, "value": 30.0},          # 2 -> 计时至 15
+        {"kind": "close_command", "time": 10.0},                # 3（投影入口前）
+        {"kind": "shutter", "time": 10.0, "state": "closing"},  # 4（投影入口前）
+        {"kind": "shutter", "time": 10.0, "state": "closed"},   # 5（投影入口前）
+    ]
+    r = _post(_payload(events, trip_duration=5.0, stale_after=1000.0,
+                       command_deadline=0.0, close_deadline=0.0))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(s["start"], s["end"], s["state"], s["projected"])
+            for s in body["status_timeline"]] == [
+        (0.0, 15.0, "safe", False),
+        (15.0, 1010.0, "unsafe", True),
+        (1010.0, None, "unknown", True),
+    ]
+    ri = body["risk_intervals"][0]
+    assert ri["start"] == 15.0 and ri["end"] is None
+    assert ri["projected"] is True
+    assert ri["entry_event_indices"] == [2]
+    assert ri["command_due"] == 15.0 and ri["close_due"] == 15.0
+    assert ri["command_time"] is None
+    assert ri["command_event_index"] is None
+    assert body["horizon"] == 10.0
+    assert ri["command_overdue"] == 0.0   # max(0, 10 − 15)
+    assert ri["already_closed_at_entry"] is True
+    assert ri["closed_time"] == 15.0
+    assert ri["closed_event_index"] == 5
     assert ri["close_overdue"] == 0.0
 
 

@@ -26,6 +26,15 @@
 ``unknown`` 之间若无 ``safe`` 间隔，视为同一段连续风险（共享最早进入时刻的
 义务）；从 ``safe`` 再次进入则产生新义务。
 
+义务归属按 **(时刻, 原始事件索引)** 的全序判定：每个状态入口在该序中有确定
+位置——计时器在同刻事件组**之前**成熟的触发/复位落在 ``(t, -1)``（同刻所有
+输入事件都在入口之后，可履行本次义务）；``trip_duration=0`` 的当刻触发落在
+触发天气事件自身的位置（其后的同刻事件可履行，其前的不可履行）；中断因要求
+“严格超过”，在随后一组中回拨到 ``stale_bound`` 并位于该时刻全部输入事件
+**之后** ``(stale_bound, +∞)``（恰在边界到达的命令不算履行）。只有严格位于
+入口之后的关顶命令与 ``closed`` 能履行本次义务；严格在入口之前已生效的
+``closed`` 才设置 ``already_closed_at_entry``。
+
 末个事件之后，引擎会把已挂起的计时（触发/复位/中断）按发生时刻**投影**到
 时间线中（``projected=true``），不再有新事件可履行这些未来义务。
 """
@@ -45,6 +54,13 @@ WIND = "wind"
 RAIN = "rain"
 COMMAND = "close_command"
 SHUTTER = "shutter"
+
+# 状态入口在 (时刻, 序号) 全序中的序号哨兵：
+# - BEFORE_GROUP：计时器在同刻事件组之前成熟（触发/复位在边界时刻即成熟）；
+# - AFTER_GROUP：中断在随后一组中回拨到 stale_bound，严格超过才成立，故位于
+#   该时刻全部输入事件之后（恰在边界到达的命令不算履行）。
+BEFORE_GROUP = -1
+AFTER_GROUP = float("inf")
 
 
 class InterlockValidationError(ValueError):
@@ -179,6 +195,8 @@ def audit_interlock(
         "state": UNKNOWN,
         "cause": [],
         "projected": False,
+        # 初始 unknown 段始于首个事件时刻、早于该时刻任何输入事件
+        "entry_pos": (t0, BEFORE_GROUP),
     }
 
     commands: list[CommandRecord] = []
@@ -187,7 +205,13 @@ def audit_interlock(
     def held_indices() -> list[int]:
         return [k for k in (wind_idx, rain_idx) if k is not None]
 
-    def change_state(new: str, t: float, cause: list[int], projected: bool) -> None:
+    def change_state(
+        new: str,
+        t: float,
+        cause: list[int],
+        projected: bool,
+        entry_pos: tuple[float, float],
+    ) -> None:
         nonlocal cur
         if cur["state"] == new:
             return
@@ -196,6 +220,7 @@ def audit_interlock(
             cur["state"] = new
             cur["cause"] = list(cause)
             cur["projected"] = projected
+            cur["entry_pos"] = entry_pos
             return
         cur["end"] = t
         segments.append(cur)
@@ -205,18 +230,22 @@ def audit_interlock(
             "state": new,
             "cause": list(cause),
             "projected": projected,
+            "entry_pos": entry_pos,
         }
 
-    def fire_run(projected: bool) -> None:
+    def fire_run(projected: bool, entry_order: float = BEFORE_GROUP) -> None:
         nonlocal weather, run, run_fire
         assert run is not None and run_fire is not None
         kind, _ = run
+        # 计时器成熟时刻先于/在同刻事件组边界；组内当刻触发（duration==0）
+        # 由调用方传入触发事件的原始索引作为入口序号
+        entry_pos = (run_fire, entry_order)
         if kind == "trip":
-            change_state(UNSAFE, run_fire, held_indices(), projected)
+            change_state(UNSAFE, run_fire, held_indices(), projected, entry_pos)
             weather = UNSAFE
             # 越限保持中，复位条件不可能同时成立，无需立即起复位计时
         else:
-            change_state(SAFE, run_fire, held_indices(), projected)
+            change_state(SAFE, run_fire, held_indices(), projected, entry_pos)
             weather = SAFE
         run = None
         run_fire = None
@@ -224,7 +253,15 @@ def audit_interlock(
     def fire_stale(projected: bool) -> None:
         nonlocal weather, run, run_fire, stale_bound
         assert stale_bound is not None
-        change_state(UNKNOWN, stale_bound, held_indices(), projected)
+        # 严格超过 stale_after 才中断：回拨到 stale_bound 时位于该时刻全部
+        # 输入事件之后（恰在边界到达的更新会取消它，命令则不能履行本义务）
+        change_state(
+            UNKNOWN,
+            stale_bound,
+            held_indices(),
+            projected,
+            (stale_bound, AFTER_GROUP),
+        )
         weather = UNKNOWN
         run = None
         run_fire = None
@@ -242,8 +279,9 @@ def audit_interlock(
         stale_bound = t + stale_after
 
         if weather == UNKNOWN:
-            # 恢复观测：立即回到 safe，触发/复位计时重新开始
-            change_state(SAFE, t, [ev.index], False)
+            # 恢复观测：立即回到 safe，触发/复位计时重新开始。入口位置就是
+            # 本天气事件（同刻更早的命令不能履行已结束的 unknown 义务）
+            change_state(SAFE, t, [ev.index], False, (t, ev.index))
             weather = SAFE
 
         if weather == SAFE:
@@ -251,9 +289,10 @@ def audit_interlock(
                 if run is None or run[0] != "trip":
                     run = ("trip", t)
                     run_fire = t + trip_duration
-                # duration == 0：本次更新当刻进入 unsafe（先于同刻后续事件）
+                # duration == 0：本次更新当刻进入 unsafe（先于同刻后续事件，
+                # 但晚于同刻更早的命令/快门事件）
                 if run_fire <= t:
-                    fire_run(False)
+                    fire_run(False, entry_order=ev.index)
             else:
                 run, run_fire = None, None
         elif weather == UNSAFE:
@@ -262,7 +301,7 @@ def audit_interlock(
                     run = ("reset", t)
                     run_fire = t + reset_duration
                 if run_fire <= t:
-                    fire_run(False)
+                    fire_run(False, entry_order=ev.index)
             else:
                 run, run_fire = None, None
 
@@ -372,29 +411,41 @@ def audit_interlock(
             j += 1
         first, last = segments[i], segments[j - 1]
         start, end = first["start"], last["end"]
+        # 入口在 (时刻, 原始事件索引) 全序中的位置：只有严格位于其后的
+        # 命令 / closed 能履行本次义务，严格在其前已 closed 才算进入即已关闭
+        entry_pos: tuple[float, float] = first["entry_pos"]
 
         command_due = start + command_deadline
         close_due = start + close_deadline
         horizon = end if end is not None else t_last
 
-        cmd = next((c for c in commands if c.time >= start), None)
+        cmd = next(
+            (c for c in commands if (c.time, c.event_index) > entry_pos),
+            None,
+        )
         command_overdue = (
             max(0.0, cmd.time - command_due)
             if cmd is not None
             else max(0.0, horizon - command_due)
         )
 
-        prior = [p for p in shutter_points if p[0] <= start]
+        prior = [
+            p for p in shutter_points if (p[0], p[1]) < entry_pos
+        ]
         already_closed = bool(prior and prior[-1][2] == "closed")
         closed_time: float | None
         closed_idx: int | None
         if already_closed:
-            # 进入义务时快门本已 closed：视为在进入时刻即确认
+            # 进入义务前快门本已 closed：视为在进入时刻即确认
             closed_time, closed_idx = start, prior[-1][1]
             close_overdue = 0.0
         else:
             fut = next(
-                (p for p in shutter_points if p[0] >= start and p[2] == "closed"),
+                (
+                    p
+                    for p in shutter_points
+                    if (p[0], p[1]) > entry_pos and p[2] == "closed"
+                ),
                 None,
             )
             if fut is not None:
